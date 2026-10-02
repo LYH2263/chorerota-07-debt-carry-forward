@@ -49,3 +49,14 @@ input, select, textarea {
 .list { padding: 0; margin: 0; }
 .muted { color: var(--muted); font-size: 13px; }
 .err { color: #b33a2c; }
+.table { width: 100%; border-collapse: collapse; font-size: 13px; margin: 8px 0; }
+.table th { text-align: left; font-weight: 600; color: var(--muted); background: var(--card); }
+.table th, .table td { padding: 7px 8px; border-bottom: 1px solid var(--line); }
+.table tr:last-child td { border-bottom: 0; }
+.table .num { text-align: right; font-variant-numeric: tabular-nums; }
+.debt { color: #b33a2c; }
+.credit { color: #2f7d4f; }
+.chip.amber { background: #fdecc8; color: #8a5a12; }
+.ledger-note { margin: 6px 0 12px; font-size: 12px; }
+.week-bar { display: flex; gap: 8px; align-items: center; margin: 12px 0; flex-wrap: wrap; }
+.week-bar select { width: auto; margin: 0; }

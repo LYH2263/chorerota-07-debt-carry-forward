@@ -1,10 +1,14 @@
-import json
+import re
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from app import seed
 from app.db import connect
-from app.engines.rota import build_week_slots, swap_legal, apply_swap
+from app.engines.rota import swap_legal, apply_swap
+from app.modules.debt import (
+    pin_generation, week_ledger, members_debt_view,
+    WeekSettledError, BadDaysError,
+)
 
 app = FastAPI(title="Chorerota", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -18,6 +22,11 @@ def health(): return {"ok": True, "project": "chorerota"}
 @app.get("/api/members")
 def list_members():
     c = connect(); rows = [dict(r) for r in c.execute("SELECT * FROM members")]; c.close(); return rows
+
+@app.get("/api/members/debts")
+def members_debts():
+    # 成员页债表/逐周台账：与看板同源于钉死的 debt_entries
+    c = connect(); view = members_debt_view(c); c.close(); return view
 
 @app.post("/api/members")
 def add_member(body: dict):
@@ -39,7 +48,7 @@ def add_task(body: dict):
 
 @app.get("/api/weeks")
 def list_weeks():
-    c = connect(); rows = [dict(r) for r in c.execute("SELECT * FROM weeks")]; c.close(); return rows
+    c = connect(); rows = [dict(r) for r in c.execute("SELECT * FROM weeks ORDER BY id")]; c.close(); return rows
 
 @app.get("/api/weeks/{week_id}/board")
 def week_board(week_id: int):
@@ -49,11 +58,28 @@ def week_board(week_id: int):
     assigns = [dict(r) for r in c.execute("SELECT * FROM assignments WHERE week_id=?", (week_id,))]
     members = {r["id"]: r["name"] for r in c.execute("SELECT id,name FROM members")}
     tasks = {r["id"]: r["title"] for r in c.execute("SELECT id,title FROM tasks")}
+    ledger = week_ledger(c, week_id)
     c.close()
     for a in assigns:
         a["member_name"] = members.get(a["member_id"], "?")
         a["task_title"] = tasks.get(a["task_id"], "?")
-    return {"week": dict(week), "assignments": assigns}
+    return {"week": dict(week), "assignments": assigns, "ledger": ledger}
+
+@app.post("/api/weeks")
+def create_week(body: dict = None):
+    body = body or {}
+    c = connect()
+    label = body.get("label")
+    if not label:
+        nums = []
+        for r in c.execute("SELECT label FROM weeks"):
+            m = re.search(r"(\d+)", r["label"] or "")
+            if m: nums.append(int(m.group(1)))
+        label = f"第{(max(nums) + 1) if nums else 1}周"
+    cur = c.execute("INSERT INTO weeks(label,status,frozen) VALUES (?,?,0)", (label, "draft"))
+    c.commit()
+    row = dict(c.execute("SELECT * FROM weeks WHERE id=?", (cur.lastrowid,)).fetchone())
+    c.close(); return row
 
 class GenBody(BaseModel):
     days: int = 7
@@ -63,18 +89,18 @@ def generate(week_id: int, body: GenBody = GenBody()):
     c = connect()
     week = c.execute("SELECT * FROM weeks WHERE id=?", (week_id,)).fetchone()
     if not week: c.close(); raise HTTPException(404, "week not found")
-    mids = [r["id"] for r in c.execute("SELECT id FROM members WHERE active=1 AND data_quality='clean' ORDER BY id")]
-    tids = [r["id"] for r in c.execute("SELECT id FROM tasks WHERE data_quality='clean' AND weight>0 ORDER BY id")]
-    slots = build_week_slots(mids, tids, days=body.days)
-    c.execute("DELETE FROM assignments WHERE week_id=?", (week_id,))
-    for s in slots:
-        c.execute("INSERT INTO assignments(week_id,day,task_id,member_id) VALUES (?,?,?,?)",
-                  (week_id, s["day"], s["task_id"], s["member_id"]))
-    c.execute("UPDATE weeks SET status='ready' WHERE id=?", (week_id,))
+    try:
+        # 生成即落钉：占格快照 + 债务台账写入；已钉周拒绝重新生成
+        result = pin_generation(c, week_id, days=body.days)
+    except WeekSettledError:
+        c.close(); raise HTTPException(409, "week_already_settled")
+    except BadDaysError:
+        c.close(); raise HTTPException(400, "bad_days")
     c.commit(); c.close()
-    return {"count": len(slots), "slots": slots}
+    return result
 
 class SwapBody(BaseModel):
+    # 对调只改 assignments.member_id，永不重算 debt_entries（钉账不随对调变动）
     a_day: int; a_task: int; b_day: int; b_task: int; note: str = ""
 
 @app.post("/api/weeks/{week_id}/swaps")
