@@ -4,7 +4,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from app import seed
 from app.db import connect
-from app.engines.rota import build_week_slots, swap_legal, apply_swap
+from app.engines.rota import swap_legal, apply_swap
+from app.modules import debt_rollover, debt_view
 
 app = FastAPI(title="Chorerota", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -49,11 +50,21 @@ def week_board(week_id: int):
     assigns = [dict(r) for r in c.execute("SELECT * FROM assignments WHERE week_id=?", (week_id,))]
     members = {r["id"]: r["name"] for r in c.execute("SELECT id,name FROM members")}
     tasks = {r["id"]: r["title"] for r in c.execute("SELECT id,title FROM tasks")}
+    debt = debt_view.week_debt(c, week_id)
     c.close()
     for a in assigns:
         a["member_name"] = members.get(a["member_id"], "?")
         a["task_title"] = tasks.get(a["task_id"], "?")
-    return {"week": dict(week), "assignments": assigns}
+    return {"week": dict(week), "assignments": assigns, "debt": debt}
+
+class WeekBody(BaseModel):
+    label: str = "新的一周"
+
+@app.post("/api/weeks")
+def create_week(body: WeekBody):
+    c = connect()
+    cur = c.execute("INSERT INTO weeks(label,status) VALUES (?,?)", (body.label, "draft"))
+    c.commit(); wid = cur.lastrowid; c.close(); return {"id": wid, "status": "draft"}
 
 class GenBody(BaseModel):
     days: int = 7
@@ -61,18 +72,23 @@ class GenBody(BaseModel):
 @app.post("/api/weeks/{week_id}/generate")
 def generate(week_id: int, body: GenBody = GenBody()):
     c = connect()
-    week = c.execute("SELECT * FROM weeks WHERE id=?", (week_id,)).fetchone()
-    if not week: c.close(); raise HTTPException(404, "week not found")
-    mids = [r["id"] for r in c.execute("SELECT id FROM members WHERE active=1 AND data_quality='clean' ORDER BY id")]
-    tids = [r["id"] for r in c.execute("SELECT id FROM tasks WHERE data_quality='clean' AND weight>0 ORDER BY id")]
-    slots = build_week_slots(mids, tids, days=body.days)
-    c.execute("DELETE FROM assignments WHERE week_id=?", (week_id,))
-    for s in slots:
-        c.execute("INSERT INTO assignments(week_id,day,task_id,member_id) VALUES (?,?,?,?)",
-                  (week_id, s["day"], s["task_id"], s["member_id"]))
-    c.execute("UPDATE weeks SET status='ready' WHERE id=?", (week_id,))
+    try:
+        result = debt_rollover.generate_week(c, week_id, days=body.days)
+    except LookupError:
+        c.close(); raise HTTPException(404, "week not found")
     c.commit(); c.close()
-    return {"count": len(slots), "slots": slots}
+    return result
+
+@app.get("/api/members/debt")
+def members_debt():
+    c = connect(); rows = debt_view.member_debts(c); c.close(); return rows
+
+@app.get("/api/members/{member_id}/debt")
+def member_debt_history(member_id: int):
+    c = connect()
+    m = c.execute("SELECT id FROM members WHERE id=?", (member_id,)).fetchone()
+    if not m: c.close(); raise HTTPException(404, "member not found")
+    out = debt_view.member_history(c, member_id); c.close(); return out
 
 class SwapBody(BaseModel):
     a_day: int; a_task: int; b_day: int; b_task: int; note: str = ""
